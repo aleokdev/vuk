@@ -152,7 +152,7 @@ namespace vuk {
 		std::unordered_map<Name, Name> resolves; // src -> dst
 
 		std::unique_ptr<FutureBase> wait;
-		FutureBase* signal;
+		FutureBase* signal = nullptr;
 
 		std::function<void(CommandBuffer&)> execute;
 	};
@@ -167,6 +167,7 @@ namespace vuk {
 
 	struct RenderGraph {
 		RenderGraph();
+		RenderGraph(Name name);
 		~RenderGraph();
 
 		RenderGraph(const RenderGraph&) = delete;
@@ -218,14 +219,12 @@ namespace vuk {
 		/// @brief Attach a future of an image to the given name
 		/// @param name Name of the resource to attach to
 		/// @param future Future to be consumed into this rendergraph
-		/// @param final Desired Access to the resource after this rendergraph
-		void attach_in(Name name, Future<ImageAttachment>&& future, Access final);
+		void attach_in(Name name, Future<ImageAttachment>&& future);
 
 		/// @brief Attach a future of a buffer to the given name
 		/// @param name Name of the resource to attach to
 		/// @param future Future to be consumed into this rendergraph
-		/// @param final Desired Access to the resource after this rendergraph
-		void attach_in(Name name, Future<Buffer>&& future, Access final);
+		void attach_in(Name name, Future<Buffer>&& future);
 
 		/// @brief Request the rendergraph to allocate an image and attach it to the given name
 		/// @param name Name of the resource to attach to
@@ -262,6 +261,7 @@ namespace vuk {
 
 	private:
 		struct RGImpl* impl;
+		Name name;
 		friend struct ExecutableRenderGraph;
 
 		/// @brief Check if this rendergraph is valid.

@@ -22,7 +22,11 @@ namespace vuk {
 		return Name(suffix.c_str());
 	}
 
-	RenderGraph::RenderGraph() : impl(new RGImpl) {}
+	RenderGraph::RenderGraph() : impl(new RGImpl) {
+		name = Name(std::to_string(reinterpret_cast<uintptr_t>(impl)));
+	}
+
+	RenderGraph::RenderGraph(Name name) : impl(new RGImpl), name(name) {}
 
 	RenderGraph::RenderGraph(RenderGraph&& o) noexcept : impl(std::exchange(o.impl, nullptr)) {}
 	RenderGraph& RenderGraph::operator=(RenderGraph&& o) noexcept {
@@ -512,7 +516,7 @@ namespace vuk {
 		impl->bound_attachments.emplace(name, attachment_info);
 	}
 
-	void RenderGraph::attach_in(Name name, Future<ImageAttachment>&& fimg, Access final) {
+	void RenderGraph::attach_in(Name name, Future<ImageAttachment>&& fimg) {
 		if (fimg.get_status() == FutureBase::Status::eSubmitted || fimg.get_status() == FutureBase::Status::eHostAvailable) {
 			auto att = fimg.control->get_result<ImageAttachment>();
 			AttachmentRPInfo attachment_info;
@@ -523,40 +527,44 @@ namespace vuk {
 
 			attachment_info.should_clear = false;
 			attachment_info.initial = { fimg.control->last_use.stages, fimg.control->last_use.access, fimg.control->last_use.layout };
-			attachment_info.final = to_use(final);
+			attachment_info.final = to_use(vuk::Access::eNone);
 
-			add_pass({ .name = fimg.output_binding.append("_ACQUIRE"),
+			add_pass({ .name = fimg.output_binding.append("_FUTURE_ACQUIRE"),
 			           .resources = { Resource{ name.append("_"), Resource::Type::eImage, eAcquire, name } },
 			           .wait = std::move(fimg.control) });
 
 			impl->bound_attachments.emplace(name.append("_"), attachment_info);
 		} else if (fimg.get_status() == FutureBase::Status::eRenderGraphBound || fimg.get_status() == FutureBase::Status::eOutputAttached) {
 			fimg.get_status() = FutureBase::Status::eInputAttached;
-			append(name, std::move(*fimg.rg));
-			add_pass({ .name = fimg.output_binding.append("_ACQUIRE"),
-			           .resources = { Resource{ name.append("::").append(fimg.output_binding).append("+"), Resource::Type::eImage, eAcquire, name } } });
-			add_alias(name, name.append("::").append(fimg.output_binding));
+			if (fimg.rg->impl) {
+				append(this->name, std::move(*fimg.rg));
+			}
+			add_pass({ .name = fimg.output_binding.append("_FUTURE_ACQUIRE"),
+			           .resources = { Resource{ this->name.append("::").append(fimg.output_binding).append("+"), Resource::Type::eImage, eAcquire, name } } });
+			add_alias(name, this->name.append("::").append(fimg.output_binding));
 		} else {
 			assert(0);
 		}
 	}
 
-	void RenderGraph::attach_in(Name name, Future<Buffer>&& fimg, Access final) {
+	void RenderGraph::attach_in(Name name, Future<Buffer>&& fimg) {
 		if (fimg.get_status() == FutureBase::Status::eSubmitted || fimg.get_status() == FutureBase::Status::eHostAvailable) {
 			BufferInfo buf_info{ .name = name,
 				                   .initial = { fimg.control->last_use.stages, fimg.control->last_use.access, fimg.control->last_use.layout },
-				                   .final = to_use(final),
+				                   .final = to_use(vuk::Access::eNone),
 				                   .buffer = fimg.control->get_result<Buffer>() };
 			add_pass({ .name = fimg.output_binding.append("_FUTURE_ACQUIRE"),
 			           .resources = { Resource{ name.append("_"), Resource::Type::eBuffer, eAcquire, name } },
 			           .wait = std::move(fimg.control) });
 			impl->bound_buffers.emplace(name.append("_"), buf_info);
 		} else if (fimg.get_status() == FutureBase::Status::eRenderGraphBound || fimg.get_status() == FutureBase::Status::eOutputAttached) {
+			if (fimg.rg->impl) {
+				append(this->name, std::move(*fimg.rg));
+			}
 			fimg.get_status() = FutureBase::Status::eInputAttached;
-			append(name, std::move(*fimg.rg));
 			add_pass({ .name = fimg.output_binding.append("_FUTURE_ACQUIRE"),
-			           .resources = { Resource{ name.append("::").append(fimg.output_binding).append("+"), Resource::Type::eBuffer, eAcquire, name } } });
-			add_alias(name, name.append("::").append(fimg.output_binding));
+			           .resources = { Resource{ this->name.append("::").append(fimg.output_binding).append("+"), Resource::Type::eBuffer, eAcquire, name } } });
+			add_alias(name, this->name.append("::").append(fimg.output_binding));
 		} else {
 			assert(0);
 		}
@@ -617,6 +625,12 @@ namespace vuk {
 				chain.insert(chain.begin(), UseRef{ {}, {}, vuk::eManual, vuk::eManual, attachment_info.initial, Resource::Type::eImage, {}, nullptr });
 			}
 			if (is_release(chain.back().original)) {
+				assert(chain.size() > 2); // single chain of release is not valid
+				auto& last_use_before_release = *(chain.end() - 1);
+				if (attachment_info.final.layout != ImageLayout::eUndefined) {
+					chain.insert(chain.end() - 1,
+					             UseRef{ {}, {}, vuk::eManual, vuk::eManual, attachment_info.final, Resource::Type::eImage, {}, last_use_before_release.pass });
+				}
 			} else {
 				chain.emplace_back(UseRef{ {}, {}, vuk::eManual, vuk::eManual, attachment_info.final, Resource::Type::eImage, {}, nullptr });
 			}
@@ -626,18 +640,18 @@ namespace vuk {
 			bool is_diverged = false;
 			ResourceUse original;
 			for (size_t i = 0; i < chain.size() - 1; i++) {
-				auto& left = chain[i];
+				auto* left = &chain[i];
 				auto& right = chain[i + 1];
 
-				DomainFlags left_domain = left.pass ? left.pass->domain : DomainFlagBits::eNone;
+				DomainFlags left_domain = left->pass ? left->pass->domain : DomainFlagBits::eNone;
 				DomainFlags right_domain = right.pass ? right.pass->domain : DomainFlagBits::eNone;
 
 				if (right.high_level_access == Access::eConverge) {
 					continue;
 				}
-				if (left.high_level_access == Access::eConverge) {
+				if (left->high_level_access == Access::eConverge) {
 					auto dst_use = to_use(right.high_level_access);
-					auto& left_rp = impl->rpis[left.pass->render_pass_index];
+					auto& left_rp = impl->rpis[left->pass->render_pass_index];
 					ResourceUse original;
 					// we need to reconverge this diverged image
 					// to do this we will walk backwards, and any use we find that is diverged, we will converge it into the dst_access
@@ -669,7 +683,7 @@ namespace vuk {
 							ib.image = name;
 							// attach this barrier to the end of subpass or end of renderpass
 							if (left_rp.framebufferless) {
-								left_rp.subpasses[left.pass->subpass].post_barriers.push_back(ib);
+								left_rp.subpasses[left->pass->subpass].post_barriers.push_back(ib);
 							} else {
 								left_rp.post_barriers.push_back(ib);
 							}
@@ -724,7 +738,7 @@ namespace vuk {
 							ib.image = name;
 							// attach this barrier to the end of subpass or end of renderpass
 							if (left_rp.framebufferless) {
-								left_rp.subpasses[left.pass->subpass].post_barriers.push_back(ib);
+								left_rp.subpasses[left->pass->subpass].post_barriers.push_back(ib);
 							} else {
 								left_rp.post_barriers.push_back(ib);
 							}
@@ -749,7 +763,7 @@ namespace vuk {
 						ib.image = name;
 						// attach this barrier to the end of subpass or end of renderpass
 						if (left_rp.framebufferless) {
-							left_rp.subpasses[left.pass->subpass].post_barriers.push_back(ib);
+							left_rp.subpasses[left->pass->subpass].post_barriers.push_back(ib);
 						} else {
 							left_rp.post_barriers.push_back(ib);
 						}
@@ -763,18 +777,15 @@ namespace vuk {
 				}
 
 				// first divergence
-				if (left.subrange.image == Resource::Subrange::Image{} && right.subrange.image != Resource::Subrange::Image{}) {
+				if (left->subrange.image == Resource::Subrange::Image{} && right.subrange.image != Resource::Subrange::Image{}) {
 					is_diverged = true;
 				}
 
 				ResourceUse prev_use;
-				prev_use = left.use = left.high_level_access == Access::eManual ? left.use : to_use(left.high_level_access);
+				prev_use = left->use = left->high_level_access == Access::eManual ? left->use : to_use(left->high_level_access);
 				ResourceUse next_use;
 				next_use = right.use = right.high_level_access == Access::eManual ? right.use : to_use(right.high_level_access);
 				auto subrange = right.subrange.image;
-
-				auto src_stages = prev_use.stages;
-				auto dst_stages = next_use.stages;
 
 				// if the image is diverged, then we need to find a matching previous use in the chain - either a use whose range intersects or the undiverged use
 				if (is_diverged) {
@@ -782,22 +793,27 @@ namespace vuk {
 						auto& ch = chain[j];
 						if (ch.subrange.image == right.subrange.image) { // TODO: we want subset not equality
 							prev_use = ch.use;
+							left = &ch;
 							break;
 						}
 						if (ch.subrange.image == Resource::Subrange::Image{}) { // TODO: subset covers this case
 							prev_use = ch.use;
+							left = &ch;
 							break;
 						}
 					}
 				}
 
-				if (is_acquire(left.original)) {
+				auto src_stages = prev_use.stages;
+				auto dst_stages = next_use.stages;
+
+				if (is_acquire(left->original)) {
 					// acquire without release - must be first in chain
 					assert(i == 0);
 					// we are acquiring from a future
-					auto wait_fut = left.pass->pass.wait.get();
+					auto wait_fut = left->pass->pass.wait.get();
 					if (wait_fut) {
-						left.pass->absolute_waits.emplace_back(wait_fut->initial_domain, wait_fut->initial_visibility);
+						left->pass->absolute_waits.emplace_back(wait_fut->initial_domain, wait_fut->initial_visibility);
 
 						left_domain = wait_fut->initial_domain;
 						src_stages = wait_fut->last_use.stages;
@@ -806,7 +822,7 @@ namespace vuk {
 					} else {
 						// we are acquiring from a queue
 						DomainFlags src_domain;
-						switch (left.original) {
+						switch (left->original) {
 						case eAcquireFromGraphics:
 							src_domain = DomainFlagBits::eGraphicsQueue;
 							break;
@@ -830,7 +846,7 @@ namespace vuk {
 				bool crosses_queue = (left_domain != DomainFlagBits::eNone && right_domain != DomainFlagBits::eNone &&
 				                      (left_domain & DomainFlagBits::eQueueMask) != (right_domain & DomainFlagBits::eQueueMask));
 
-				if (is_acquire(left.original)) {
+				if (is_acquire(left->original)) {
 					if (crosses_queue) {
 						ImageBarrier acquire_barrier;
 						VkImageMemoryBarrier barrier{ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
@@ -860,7 +876,7 @@ namespace vuk {
 					if (right.pass->pass.signal) {
 						auto& fut = *right.pass->pass.signal;
 						fut.last_use = QueueResourceUse{
-							left.original, prev_use.stages, prev_use.access, prev_use.layout, (DomainFlagBits)(left_domain & DomainFlagBits::eQueueMask).m_mask
+							left->original, prev_use.stages, prev_use.access, prev_use.layout, (DomainFlagBits)(left_domain & DomainFlagBits::eQueueMask).m_mask
 						};
 						attachment_info.attached_future = &fut;
 					}
@@ -877,10 +893,10 @@ namespace vuk {
 						dst_domain = DomainFlagBits::eTransferQueue;
 						break;
 					default:
-						dst_domain = left.pass->domain; // no domain change
+						dst_domain = left->pass->domain & DomainFlagBits::eQueueMask; // no domain change
 					}
 
-					bool release_to_different_queue = (left.pass->domain & DomainFlagBits::eQueueMask) != dst_domain;
+					bool release_to_different_queue = (left->pass->domain & DomainFlagBits::eQueueMask) != dst_domain;
 
 					if (release_to_different_queue) { // release half of QFOT
 						ImageBarrier release_barrier;
@@ -900,11 +916,11 @@ namespace vuk {
 						release_barrier.dst = PipelineStageFlagBits::eBottomOfPipe; // NONE
 						release_barrier.barrier = barrier;
 						release_barrier.image = name;
-						auto& left_rp = impl->rpis[left.pass->render_pass_index];
+						auto& left_rp = impl->rpis[left->pass->render_pass_index];
 						left_rp.post_barriers.emplace_back(release_barrier);
 					}
 
-					auto& left_rp = impl->rpis[left.pass->render_pass_index];
+					auto& left_rp = impl->rpis[left->pass->render_pass_index];
 					if (is_framebuffer_attachment(prev_use)) {
 						assert(!left_rp.framebufferless);
 						auto& rp_att = *contains_if(left_rp.attachments, [name](auto& att) { return att.name == name; });
@@ -926,8 +942,8 @@ namespace vuk {
 				}
 
 				if (crosses_queue) {
-					left.pass->is_waited_on = true;
-					right.pass->waits.emplace_back((DomainFlagBits)(left_domain & DomainFlagBits::eQueueMask).m_mask, left.pass);
+					left->pass->is_waited_on = true;
+					right.pass->waits.emplace_back((DomainFlagBits)(left_domain & DomainFlagBits::eQueueMask).m_mask, left->pass);
 
 					assert(prev_use.layout != ImageLayout::ePreinitialized);
 					assert(next_use.layout != ImageLayout::eUndefined);
@@ -951,7 +967,7 @@ namespace vuk {
 						release_barrier.dst = PipelineStageFlagBits::eBottomOfPipe; // NONE
 						release_barrier.barrier = barrier;
 						release_barrier.image = name;
-						auto& left_rp = impl->rpis[left.pass->render_pass_index];
+						auto& left_rp = impl->rpis[left->pass->render_pass_index];
 						left_rp.post_barriers.emplace_back(release_barrier);
 					}
 					{
@@ -979,10 +995,10 @@ namespace vuk {
 					continue;
 				}
 
-				bool crosses_rpass = (left.pass == nullptr || right.pass == nullptr || left.pass->render_pass_index != right.pass->render_pass_index);
+				bool crosses_rpass = (left->pass == nullptr || right.pass == nullptr || left->pass->render_pass_index != right.pass->render_pass_index);
 				if (crosses_rpass) {
-					if (left.pass) { // RenderPass ->
-						auto& left_rp = impl->rpis[left.pass->render_pass_index];
+					if (left->pass) { // RenderPass ->
+						auto& left_rp = impl->rpis[left->pass->render_pass_index];
 						// if this is an attachment, we specify layout
 						if (is_framebuffer_attachment(prev_use)) {
 							assert(!left_rp.framebufferless);
@@ -1023,7 +1039,7 @@ namespace vuk {
 							ib.image = name;
 							// attach this barrier to the end of subpass or end of renderpass
 							if (left_rp.framebufferless) {
-								left_rp.subpasses[left.pass->subpass].post_barriers.push_back(ib);
+								left_rp.subpasses[left->pass->subpass].post_barriers.push_back(ib);
 							} else {
 								left_rp.post_barriers.push_back(ib);
 							}
@@ -1089,10 +1105,10 @@ namespace vuk {
 					// WAW, WAR, RAW accesses need sync
 
 					// if we merged the passes into a subpass, no sync is needed
-					if (left.pass->subpass == right.pass->subpass)
+					if (left->pass->subpass == right.pass->subpass)
 						continue;
 					if (is_framebuffer_attachment(prev_use) && (is_write_access(prev_use) || is_write_access(next_use))) {
-						assert(left.pass->render_pass_index == right.pass->render_pass_index);
+						assert(left->pass->render_pass_index == right.pass->render_pass_index);
 						auto& rp = impl->rpis[right.pass->render_pass_index];
 						VkSubpassDependency sd{};
 						sd.dstAccessMask = (VkAccessFlags)next_use.access;
@@ -1100,11 +1116,12 @@ namespace vuk {
 						sd.dstSubpass = right.pass->subpass;
 						sd.srcAccessMask = is_read_access(prev_use) ? 0 : (VkAccessFlags)prev_use.access;
 						sd.srcStageMask = (VkPipelineStageFlags)prev_use.stages;
-						sd.srcSubpass = left.pass->subpass;
+						sd.srcSubpass = left->pass->subpass;
 						rp.rpci.subpass_dependencies.push_back(sd);
 					}
-					auto& left_rp = impl->rpis[left.pass->render_pass_index];
-					if (left_rp.framebufferless && (is_write_access(prev_use) || is_write_access(next_use))) {
+					auto& left_rp = impl->rpis[left->pass->render_pass_index];
+					auto& right_rp = impl->rpis[right.pass->render_pass_index];
+					if (left_rp.framebufferless && (next_use.layout != prev_use.layout || is_write_access(prev_use) || is_write_access(next_use))) {
 						// right layout == Undefined means the chain terminates, no
 						// transition/barrier
 						if (next_use.layout == ImageLayout::eUndefined)
@@ -1120,7 +1137,7 @@ namespace vuk {
 						barrier.subresourceRange.layerCount = subrange.layer_count;
 						barrier.subresourceRange.levelCount = subrange.level_count;
 						ImageBarrier ib{ .image = name, .barrier = barrier, .src = prev_use.stages, .dst = next_use.stages };
-						left_rp.subpasses[left.pass->subpass].post_barriers.push_back(ib);
+						right_rp.subpasses[right.pass->subpass].pre_barriers.push_back(ib);
 					}
 				}
 			}

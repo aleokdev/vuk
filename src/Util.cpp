@@ -4,8 +4,8 @@
 #include "vuk/RenderGraph.hpp"
 #include "vuk/SampledImage.hpp"
 
-#include <mutex>
 #include <atomic>
+#include <mutex>
 
 namespace vuk {
 	struct QueueImpl {
@@ -106,7 +106,7 @@ namespace vuk {
 		for (auto& [alloc, rg] : ergs) {
 			auto sbundle = rg->execute(*alloc, swapchains_with_indexes);
 			if (!sbundle) {
-				return { expected_error, sbundle.error() };
+				return Result<std::vector<SubmitBundle>>(std::move(sbundle));
 			}
 			bool has_waits = false;
 			for (auto& batch : sbundle->batches) {
@@ -268,9 +268,9 @@ namespace vuk {
 	                            VkSemaphore render_complete) {
 		auto bundles = execute(rgs, swapchains_with_indexes);
 		if (!bundles) {
-			return { expected_error, bundles.error() };
+			return bundles;
 		}
-		assert(bundles->size() < 2); // can't handle this yet
+
 		for (auto& bundle : *bundles) {
 			VUK_DO_OR_RETURN(submit(allocator, bundle, present_rdy, render_complete));
 		}
@@ -286,15 +286,8 @@ namespace vuk {
 
 		uint32_t image_index = (uint32_t)-1;
 		VkResult acq_result = vkAcquireNextImageKHR(ctx.device, swapchain->swapchain, UINT64_MAX, present_rdy, VK_NULL_HANDLE, &image_index);
-		if (acq_result != VK_SUCCESS) {
-			VkSubmitInfo si{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
-			si.commandBufferCount = 0;
-			si.pCommandBuffers = nullptr;
-			si.waitSemaphoreCount = 1;
-			si.pWaitSemaphores = &present_rdy;
-			VkPipelineStageFlags flags = (VkPipelineStageFlags)PipelineStageFlagBits::eTopOfPipe;
-			si.pWaitDstStageMask = &flags;
-			VUK_DO_OR_RETURN(ctx.submit_graphics(std::span{ &si, 1 }, VK_NULL_HANDLE));
+		// VK_SUBOPTIMAL_KHR shouldn't stop presentation; it is handled at the end
+		if (acq_result != VK_SUCCESS && acq_result != VK_SUBOPTIMAL_KHR) {
 			return { expected_error, PresentException{ acq_result } };
 		}
 
@@ -314,6 +307,9 @@ namespace vuk {
 			return { expected_error, PresentException{ present_result } };
 		}
 
+		if (acq_result == VK_SUBOPTIMAL_KHR) {
+			return { expected_error, PresentException{ acq_result } };
+		}
 		return { expected_value };
 	}
 
@@ -382,7 +378,8 @@ namespace vuk {
 	template<class T>
 	Result<T> Future<T>::get() {
 		if (control->status == FutureBase::Status::eInputAttached || control->status == FutureBase::Status::eInitial) {
-			return { expected_error }; // can't get result of future that has not been attached anything or has been attached into a rendergraph
+			return { expected_error,
+				       RenderGraphException{} }; // can't get result of future that has not been attached anything or has been attached into a rendergraph
 		} else if (control->status == FutureBase::Status::eHostAvailable) {
 			return { expected_value, control->get_result<T>() };
 		} else if (control->status == FutureBase::Status::eSubmitted) {
@@ -403,7 +400,7 @@ namespace vuk {
 	template<class T>
 	Result<void> Future<T>::submit() {
 		if (control->status == FutureBase::Status::eInputAttached || control->status == FutureBase::Status::eInitial) {
-			return { expected_error };
+			return { expected_error, RenderGraphException{} };
 		} else if (control->status == FutureBase::Status::eHostAvailable || control->status == FutureBase::Status::eSubmitted) {
 			return { expected_value }; // nothing to do
 		} else {
